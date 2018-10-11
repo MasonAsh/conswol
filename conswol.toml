@@ -1,0 +1,9 @@
+dir = "./"
+
+[build_cmd]
+command = "cargo"
+args = ["build"]
+
+[run_cmd]
+command = "cargo"
+args = ["run"]
