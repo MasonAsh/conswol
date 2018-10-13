@@ -1,5 +1,16 @@
 dir = "./"
 
+[problem_matcher]
+regex = "(\\w+):...+\\n\\s+--> (.*?):(\\d+):(\\d+)"
+file_group = 2
+line_group = 3
+col_group = 4
+severity_group = 1
+
+[problem_matcher.severity_mapper]
+error = "Error"
+warning = "Warning"
+
 [build_cmd]
 command = "cargo"
 args = ["build"]

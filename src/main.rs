@@ -5,6 +5,7 @@ extern crate toml;
 extern crate tui;
 extern crate termion;
 extern crate failure;
+extern crate regex;
 
 use std::io;
 use std::io::prelude::*;
@@ -13,6 +14,7 @@ use std::path;
 use std::sync::mpsc;
 use std::sync::mpsc::{Sender, Receiver};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use tui::Terminal;
 use tui::backend::TermionBackend;
@@ -26,8 +28,26 @@ use termion::screen::AlternateScreen;
 
 use failure::Error;
 
+use regex::Regex;
+
+use serde::Deserializer;
+
 fn default_working_dir() -> String {
     String::from("./")
+}
+
+fn default_severity_mapper() -> HashMap<String, MessageSeverity> {
+    let mut severity_mapper = HashMap::new();
+    severity_mapper.insert(String::from("error"), MessageSeverity::Error);
+    severity_mapper.insert(String::from("warning"), MessageSeverity::Warning);
+    severity_mapper
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+enum MessageSeverity {
+    Error,
+    Warning,
+    Other,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -38,11 +58,22 @@ struct CommandConfig {
     args: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ProblemMatcher {
+    regex: String,
+    file_group: Option<u16>,
+    line_group: Option<u16>,
+    col_group: Option<u16>,
+    severity_group: Option<u16>,
+    severity_mapper: Option<HashMap<String, MessageSeverity>>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Project {
     dir: String,
     build_cmd: Option<CommandConfig>,
     run_cmd: Option<CommandConfig>,
+    problem_matcher: Option<ProblemMatcher>,
 }
 
 enum MainWindow {
@@ -50,17 +81,12 @@ enum MainWindow {
     Shell,
 }
 
-enum MessageType {
-    Error,
-    Warning,
-    Other,
-}
-
 struct LineCol(u32, u32);
 
 struct CompilerMessage {
-    message_type: MessageType,
-    line_col: Option<LineCol>,
+    severity: Option<MessageSeverity>,
+    line: Option<u32>,
+    col: Option<u32>,
     file: Option<PathBuf>,
     content: String,
 }
@@ -101,11 +127,11 @@ fn load_project(dir: &str) -> Option<Project> {
 }
 
 
-fn execute_build_cmd(build_cmd: CommandConfig, tx: Sender<BuildState>) {
+fn execute_build_cmd(build_cmd: CommandConfig, problem_matcher: &Option<ProblemMatcher>, tx: Sender<BuildState>) {
     use std::process::{Command, Output};
     use std::thread;
 
-    fn read_compiler_messages(output: &Output) -> Result<Vec<CompilerMessage>, Error> {
+    fn read_compiler_messages(output: &Output, problem_matcher: &Option<ProblemMatcher>) -> Result<Vec<CompilerMessage>, Error> {
         let mut messages = Vec::new();
 
         let stdout = output.stdout.to_owned();
@@ -116,31 +142,119 @@ fn execute_build_cmd(build_cmd: CommandConfig, tx: Sender<BuildState>) {
 
         let combined_output = stdout + stderr;
 
-        // FIXME: Actually parse out errors from the compiler output.
-        //        This is going to require some awareness of what compiler is being used.
-        for line in combined_output.lines() {
+        if let Some(problem_matcher) = problem_matcher {
+            let regex = Regex::new(problem_matcher.regex.as_str())?;
+            let captures: Vec<regex::Captures> = regex.captures_iter(combined_output.as_str()).collect();
+            for i in 0..captures.len() {
+                let capture = captures.get(i);
+                if capture.is_none() {
+                    continue;
+                }
+                let capture = capture.unwrap();
+
+                let full_match = capture.get(0).unwrap();
+                let message_start = full_match.start();
+                let message_end = if i < captures.len() - 1 {
+                    // The end of this message should be the start index of the next message
+                    captures.get(i+1).unwrap().get(0).unwrap().start()
+                } else {
+                    // Otherwise if no other captures just to the end of the output.
+                    combined_output.len()
+                };
+
+                let file = if let Some(group) = problem_matcher.file_group {
+                    match capture.get(group as usize) {
+                        Some(ma) => Some(PathBuf::from(&combined_output[ma.start() .. ma.end()])),
+                        None => None
+                    }
+                } else {
+                    None
+                };
+
+                let content = &combined_output[message_start .. message_end];
+                let content = content.to_string();
+
+                let line = if let Some(group) = problem_matcher.line_group {
+                    match capture.get(group as usize) {
+                        Some(ma) => {
+                            let cap_text = &combined_output[ma.start() .. ma.end()];
+                            cap_text.parse::<u32>().ok()
+                        },
+                        None => None
+                    }
+                } else {
+                    None
+                };
+
+                let col = if let Some(group) = problem_matcher.col_group {
+                    match capture.get(group as usize) {
+                        Some(ma) => {
+                            let cap_text = &combined_output[ma.start() .. ma.end()];
+                            cap_text.parse::<u32>().ok()
+                        },
+                        None => None
+                    }
+                } else {
+                    None
+                };
+
+                let severity = if let Some(group) = problem_matcher.severity_group {
+                    let ref severity_mapper = problem_matcher.severity_mapper;
+                    match capture.get(group as usize) {
+                        Some(ma) => {
+                            let cap_text = &combined_output[ma.start() .. ma.end()];
+                            if let Some(severity_mapper) = severity_mapper {
+                                Some(severity_mapper.get(cap_text).unwrap().to_owned())
+                            } else {
+                                match cap_text.to_lowercase().as_str() {
+                                    "error" => Some(MessageSeverity::Error),
+                                    "warning" => Some(MessageSeverity::Warning),
+                                    _ => None
+                                }
+                            }
+                        },
+                        None => None
+                    }
+                } else {
+                    None
+                };
+
+                messages.push(CompilerMessage {
+                    severity,
+                    line,
+                    col,
+                    file,
+                    content,
+                });
+            }
+        } else {
+            // No problem matcher, so just plain show the output.
             messages.push(CompilerMessage {
-                message_type: MessageType::Other,
-                line_col: None,
+                severity: None,
+                line: None,
+                col: None,
                 file: None,
-                content: line.to_string(),
+                content: combined_output
             });
         }
 
         Ok(messages)
     }
 
+    let problem_matcher = problem_matcher.clone();
+
     thread::spawn(move || {
         tx.send(BuildState::InProgress).unwrap();
 
         let command_res = Command::new(build_cmd.command)
             .args(build_cmd.args.iter())
+            .current_dir(build_cmd.working_dir)
             .output();
 
 
         match command_res {
             Ok(output) => {
-                let messages = read_compiler_messages(&output).unwrap_or_default();
+                let messages = read_compiler_messages(&output, &problem_matcher).unwrap_or_default();
                 let status = output.status;
                 let build_result = BuildResults {
                     ret_code: status.code().unwrap(),
@@ -180,6 +294,7 @@ fn draw_build_results_window<B>(mut frame: &mut Frame<B>, area: Rect, build_stat
         },
     };
 
+    // FIXME: SelectableList does not render newlines.
     SelectableList::default()
         .block(Block::default().title("Build Results").borders(Borders::ALL))
         .items(text.as_slice())
@@ -204,14 +319,44 @@ fn spawn_key_listener(key_tx: Sender<Key>) {
     });
 }
 
+fn handle_build_request(&MainState{ ref project, ref build_state, .. } : &MainState) -> Option<Receiver<BuildState>> {
+    match project.build_cmd {
+        Some(ref build_cmd) => {
+            match build_state {
+                // Don't build if a build is in progress
+                BuildState::InProgress => {None},
+                _ => {
+                    let builder_channel = mpsc::channel();
+                    let builder_tx = builder_channel.0;
+                    execute_build_cmd(build_cmd.clone(), &project.problem_matcher, builder_tx.clone());
+                    Some(builder_channel.1)
+                }
+            }
+        },
+        None => None
+    }
+}
+
 fn main() {
+    use std::env::args;
+
+    let args: Vec<String> = args().collect();
+
+    let project_dir = if let Some(project_dir) = args.get(1) {
+        project_dir
+    } else {
+        "./"
+    };
+
     let stdout = io::stdout().into_raw_mode().expect("Failed to open stdout.");
     let stdout = AlternateScreen::from(stdout);
     let backend = TermionBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("Failed to start the TUI");
+    terminal.hide_cursor().unwrap();
     let size = terminal.size().expect("Failed to get terminal size");
 
-    let project = load_project("./").expect("Sometimes things just don't work.");
+    std::env::set_current_dir(project_dir).expect("failed to load project");
+    let project = load_project(project_dir).unwrap();
 
     let main_window = MainWindow::Shell;
 
@@ -259,17 +404,7 @@ fn main() {
                 Key::Ctrl('c') => { break 'mainloop },
                 Key::Ctrl('b') => {
                     debug_message = String::from("Ctrl+b was pressed....");
-                    match main_state.project.build_cmd {
-                        Some(ref build_cmd) => {
-                            let builder_channel = mpsc::channel();
-                            let builder_tx = builder_channel.0;
-                            execute_build_cmd(build_cmd.clone(), builder_tx.clone());
-                            builder_rx = Some(builder_channel.1);
-                        },
-                        None => {
-                            debug_message = String::from("no build_cmd");
-                        }
-                    }
+                    builder_rx = handle_build_request(&main_state);
                 },
                 Key::Up => {
                     last_selection_idx -= 1;
